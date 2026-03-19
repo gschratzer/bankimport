@@ -13,7 +13,13 @@ class modBankImport extends DolibarrModules
      */
     public function __construct($db)
     {
+        global $langs, $conf;
         $this->db = $db;
+
+        if (is_object($langs)) {
+            $langs->load('bankimport@bankimport');
+        }
+
 
         $this->version = '0.0.10';
 
@@ -25,7 +31,7 @@ class modBankImport extends DolibarrModules
         // Where the module shows up in Setup
         $this->family = 'financial';
         $this->name = 'BankImport';
-        $this->description = 'Import von Kontoauszügen';
+        $this->description = $langs->trans('BANKIMPORT_Title');
         $this->const_name = 'MAIN_MODULE_BANKIMPORT';
         $this->license = 'MIT';
         $this->special = 0;
