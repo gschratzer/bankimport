@@ -69,7 +69,12 @@ print load_fiche_titre($langs->trans("BANKIMPORT_Title"));
 // Get parameters
 $accountid = GETPOST('accountid', 'int');
 $encoding = GETPOST('encoding', 'alpha'); // UTF-8 oder ISO-8859-1
+$importformat = GETPOST('importformat', 'alpha');
 $action = GETPOST('action', 'alpha');
+
+if (empty($importformat)) {
+    $importformat = 'csv';
+}
 
 // Token validation is handled by Dolibarr automatically
 
@@ -107,6 +112,7 @@ if ($action == 'upload') {
         // All validations passed, proceed with import
         $bankImport->setAccountId($accountid);
         $bankImport->setEncoding($encoding);
+        $bankImport->setImportFormat($importformat);
 
         // Validate file
         if (!$bankImport->validateFile($_FILES['statement'])) {
@@ -157,7 +163,21 @@ print '</tr>';
 print '<tr class="oddeven">';
 print '<td class="fieldrequired">'.$langs->trans("BANKIMPORT_File_label").'</td>';
 print '<td>';
-print '<input type="file" name="statement" accept=".csv,text/csv,text/plain" required>';
+print '<input type="file" name="statement" accept=".csv,.xml,text/csv,text/plain,text/xml,application/xml" required>';
+print '</td>';
+print '</tr>';
+
+// Import format selection
+print '<tr class="oddeven">';
+print '<td>'.$langs->trans("BANKIMPORT_Format").'</td>';
+print '<td>';
+print '<select name="importformat" id="importformat">';
+$formats = array('csv' => $langs->trans("BANKIMPORT_Format_CSV"), 'victoriabank_xml' => $langs->trans("BANKIMPORT_Format_VictoriaBank_XML"));
+foreach ($formats as $key => $label) {
+    $selected = ($importformat == $key) ? 'selected' : '';
+    print '<option value="'.$key.'" '.$selected.'>'.$label.'</option>';
+}
+print '</select>';
 print '</td>';
 print '</tr>';
 
@@ -191,6 +211,7 @@ document.addEventListener("DOMContentLoaded", function() {
     var form = document.querySelector("form");
     var accountSelect = document.querySelector("select[name=\'accountid\']");
     var fileInput = document.querySelector("input[name=\'statement\']");
+    var formatSelect = document.querySelector("select[name=\'importformat\']");
     var submitButton = document.getElementById("submitButton");
 
     // Disable submit button initially if no account selected
@@ -198,11 +219,20 @@ document.addEventListener("DOMContentLoaded", function() {
         var hasAccount = accountSelect.value && accountSelect.value != "0";
         var hasFile = fileInput.files && fileInput.files.length > 0;
         submitButton.disabled = !hasAccount || !hasFile;
+
+        if (formatSelect && fileInput) {
+            if (formatSelect.value === "victoriabank_xml") {
+                fileInput.setAttribute("accept", ".xml,text/xml,application/xml");
+            } else {
+                fileInput.setAttribute("accept", ".csv,text/csv,text/plain");
+            }
+        }
     }
 
     // Update submit button state when selections change
     accountSelect.addEventListener("change", updateSubmitButton);
     fileInput.addEventListener("change", updateSubmitButton);
+    if (formatSelect) formatSelect.addEventListener("change", updateSubmitButton);
 
     // Initial state
     updateSubmitButton();
