@@ -46,7 +46,12 @@ class BankImport extends CommonObject
     /**
      * @var string File encoding
      */
-    public $encoding;
+    public $encoding = 'UTF-8';
+
+    /**
+     * @var string Import format
+     */
+    public $importformat = 'csv';
 
     /**
      * @var array CSV field mapping
@@ -59,6 +64,7 @@ class BankImport extends CommonObject
         'payment_purpose' => 4,
         'creditor_id' => 5,
         'mandate_reference' => 6,
+        'customer_reference' => 7,
         'collector_reference' => 8,
         'counterparty_name' => 11,
         'counterparty_iban' => 12,
@@ -101,6 +107,18 @@ class BankImport extends CommonObject
     }
 
     /**
+     * Set import format
+     *
+     * @param string $importformat Import format
+     * @return void
+     */
+    public function setImportFormat($importformat)
+    {
+        $importformat = strtolower(trim((string) $importformat));
+        $this->importformat = ($importformat === 'victoriabank_xml') ? 'victoriabank_xml' : 'csv';
+    }
+
+    /**
      * Validate uploaded file
      *
      * @param array $file $_FILES array element
@@ -118,13 +136,25 @@ class BankImport extends CommonObject
             return false;
         }
 
-        if ($file['size'] > 10 * 1024 * 1024) { // 10MB limit
+        if ($file['size'] > 10 * 1024 * 1024) {
             $this->error = 'File too large (max 10MB)';
             return false;
         }
 
+        $name = isset($file['name']) ? (string) $file['name'] : '';
+        $type = isset($file['type']) ? (string) $file['type'] : '';
+
+        if ($this->importformat === 'victoriabank_xml') {
+            $allowedTypes = array('text/xml', 'application/xml');
+            if (!in_array($type, $allowedTypes) && !preg_match('/\.xml$/i', $name)) {
+                $this->error = 'Invalid file type (XML required)';
+                return false;
+            }
+            return true;
+        }
+
         $allowedTypes = array('text/csv', 'text/plain', 'application/csv');
-        if (!in_array($file['type'], $allowedTypes) && !preg_match('/\.csv$/i', $file['name'])) {
+        if (!in_array($type, $allowedTypes) && !preg_match('/\.csv$/i', $name)) {
             $this->error = 'Invalid file type (CSV required)';
             return false;
         }
@@ -133,7 +163,7 @@ class BankImport extends CommonObject
     }
 
     /**
-     * Process CSV file
+     * Process input file (CSV or XML transformed to CSV)
      *
      * @param string $filename File path
      * @return array Array with success count and errors
@@ -146,45 +176,63 @@ class BankImport extends CommonObject
             'skipped' => 0
         );
 
-        // Validate account ID is set
         if (empty($this->accountid) || $this->accountid <= 0) {
             $this->error = 'No valid bank account selected';
             $result['errors'][] = 'No valid bank account selected';
             return $result;
         }
 
-        $handle = fopen($filename, 'r');
+        $csvFilename = $filename;
+        $cleanupCsv = false;
+
+        if ($this->importformat === 'victoriabank_xml') {
+            $csvFilename = $this->vicxml2csv($filename);
+            if ($csvFilename === false) {
+                $result['errors'][] = $this->error;
+                return $result;
+            }
+            $cleanupCsv = true;
+        }
+
+        $handle = fopen($csvFilename, 'r');
         if (!$handle) {
+            if ($cleanupCsv && is_file($csvFilename)) {
+                @unlink($csvFilename);
+            }
             $this->error = 'Could not open file';
+            $result['errors'][] = 'Could not open file';
             return $result;
         }
 
         $row = 0;
-        while (($data = fgetcsv($handle, 0, ";")) !== FALSE) {
+        while (($data = fgetcsv($handle, 0, ';')) !== false) {
             $row++;
-            if ($row == 1) continue; // Skip header
-
-            // Convert encoding if needed
-            $data = $this->convertEncoding($data);
-
-            // Validate data
-            if (!$this->validateRow($data, $row)) {
-                $result['errors'][] = "Row $row: " . $this->error;
+            if ($row == 1) {
                 continue;
             }
 
-            // Process row
+            $data = $this->convertEncoding($data);
+
+            if (!$this->validateRow($data, $row)) {
+                $result['errors'][] = 'Row '.$row.': '.$this->error;
+                continue;
+            }
+
             $importResult = $this->processRow($data, $row);
             if ($importResult === true) {
                 $result['success']++;
             } elseif ($importResult === 'skipped') {
                 $result['skipped']++;
             } else {
-                $result['errors'][] = "Row $row: " . $importResult;
+                $result['errors'][] = 'Row '.$row.': '.$importResult;
             }
         }
 
         fclose($handle);
+        if ($cleanupCsv && is_file($csvFilename)) {
+            @unlink($csvFilename);
+        }
+
         return $result;
     }
 
@@ -198,7 +246,7 @@ class BankImport extends CommonObject
     {
         if ($this->encoding && strtoupper($this->encoding) !== 'UTF-8') {
             foreach ($data as &$field) {
-                $field = iconv($this->encoding, "UTF-8//TRANSLIT", $field);
+                $field = iconv($this->encoding, 'UTF-8//TRANSLIT', $field);
             }
         }
         return $data;
@@ -213,18 +261,17 @@ class BankImport extends CommonObject
      */
     private function validateRow($data, $row)
     {
-        if (count($data) < 15) {
+        if (count($data) < 17) {
             $this->error = 'Insufficient columns in CSV';
             return false;
         }
 
-        // Validate required fields
         if (empty($data[$this->fieldMapping['booking_date']])) {
             $this->error = 'Missing booking date';
             return false;
         }
 
-        if (empty($data[$this->fieldMapping['amount']])) {
+        if ($data[$this->fieldMapping['amount']] === '' || $data[$this->fieldMapping['amount']] === null) {
             $this->error = 'Missing amount';
             return false;
         }
@@ -243,7 +290,6 @@ class BankImport extends CommonObject
     {
         global $user;
 
-        // Extract data
         $dateo = $this->parseDate($data[$this->fieldMapping['booking_date']]);
         $datev = $this->parseDate($data[$this->fieldMapping['value_date']]);
         $label = $this->limitString($data[$this->fieldMapping['payment_purpose']]);
@@ -251,23 +297,19 @@ class BankImport extends CommonObject
         $oper = 'VIR';
         $ref = trim($data[$this->fieldMapping['mandate_reference']]);
         $categorie = null;
-        $transaction_id = null;
+        $transaction_id = trim($data[$this->fieldMapping['customer_reference']]);
         $bank_other = $data[$this->fieldMapping['counterparty_bic']];
         $iban_other = $data[$this->fieldMapping['counterparty_iban']];
         $owner_other = $data[$this->fieldMapping['counterparty_name']];
 
-        // Generate import key
         $import_key = $this->generateImportKey($transaction_id, $iban_other, $owner_other, $amount, $label, $ref);
 
-        // Check if already imported
         if ($this->isAlreadyImported($import_key)) {
             return 'skipped';
         }
 
-        // Prepare notes
         $note = $this->buildNote($data);
 
-        // Begin transaction
         $this->db->begin();
 
         try {
@@ -286,20 +328,19 @@ class BankImport extends CommonObject
                 $bank_other,
                 $iban_other,
                 $datev,
-                null, // num_releve
-                null, // amount_main_currency
+                null,
+                null,
                 $note
             );
 
             if ($bankline_id > 0) {
-                // Update import key
                 $this->updateImportKey($bankline_id, $import_key);
                 $this->db->commit();
                 return true;
-            } else {
-                $this->db->rollback();
-                return $account->error;
             }
+
+            $this->db->rollback();
+            return $account->error;
         } catch (Exception $e) {
             $this->db->rollback();
             return $e->getMessage();
@@ -307,20 +348,265 @@ class BankImport extends CommonObject
     }
 
     /**
-     * Parse date from DD.MM.YY format
+     * Convert Victoriabank XML export to temporary bankimport CSV file.
+     *
+     * @param string $filename XML filename
+     * @return string|false Temp CSV filename or false on error
+     */
+    public function vicxml2csv($filename)
+    {
+        $xmlData = @file_get_contents($filename);
+        if ($xmlData === false || trim($xmlData) === '') {
+            $this->error = 'Could not read Victoriabank XML file';
+            return false;
+        }
+
+        $xmlData = preg_replace('/^ï»¿/', '', $xmlData);
+        $requestAccount = $this->extractXmlTagValue($xmlData, 'Account');
+        $documents = $this->parseVictoriaXmlDocuments($xmlData);
+
+        $myAccount = $this->normalizeAccount($requestAccount);
+        if ($myAccount === '') {
+            $this->error = 'Victoriabank XML does not contain a valid own account';
+            return false;
+        }
+
+        if (empty($documents)) {
+            $this->error = 'Victoriabank XML structure not recognized';
+            return false;
+        }
+
+        $tmpFile = tempnam(sys_get_temp_dir(), 'bankimport_vicxml_');
+        if ($tmpFile === false) {
+            $this->error = 'Could not create temporary CSV file';
+            return false;
+        }
+
+        $handle = fopen($tmpFile, 'w');
+        if (!$handle) {
+            @unlink($tmpFile);
+            $this->error = 'Could not create temporary CSV file';
+            return false;
+        }
+
+        fputcsv($handle, array(
+            'Auftragskonto', 'Buchungstag', 'Valutadatum', 'Buchungstext', 'Verwendungszweck',
+            'Glaeubiger ID', 'Mandatsreferenz', 'Kundenreferenz', 'Sammlerreferenz',
+            'Lastschrift Ursprungsbetrag', 'Auslagenersatz Ruecklastschrift',
+            'Beguenstigter/Zahlungspflichtiger', 'Kontonummer/IBAN', 'BIC (SWIFT-Code)',
+            'Betrag', 'Waehrung', 'Info'
+        ), ';');
+
+        $writtenRows = 0;
+        foreach ($documents as $doc) {
+            $row = $this->buildCsvRowFromVictoriaDocument($doc, $myAccount);
+            if ($row === null) {
+                continue;
+            }
+            fputcsv($handle, $row, ';');
+            $writtenRows++;
+        }
+
+        fclose($handle);
+
+        if ($writtenRows === 0) {
+            @unlink($tmpFile);
+            $this->error = 'No importable transactions found in Victoriabank XML';
+            return false;
+        }
+
+        return $tmpFile;
+    }
+
+    /**
+     * Build one CSV row from one Victoriabank XML document.
+     *
+     * @param SimpleXMLElement $doc XML document node
+     * @param string $myAccount Own account
+     * @return array|null
+     */
+    private function buildCsvRowFromVictoriaDocument($doc, $myAccount)
+    {
+        $accountDebit = $this->normalizeAccount($this->getVictoriaValue($doc, 'AccountDebit'));
+        $accountCredit = $this->normalizeAccount($this->getVictoriaValue($doc, 'AccountCredit'));
+        $isOutgoing = ($accountDebit !== '' && $accountDebit === $myAccount);
+        $isIncoming = ($accountCredit !== '' && $accountCredit === $myAccount);
+
+        if (!$isOutgoing && !$isIncoming) {
+            return null;
+        }
+
+        $currency = $this->extractCurrency($this->getVictoriaValue($doc, 'AccountDebit'), $this->getVictoriaValue($doc, 'AccountCredit'), $myAccount);
+        if ($currency === '') {
+            $currency = 'MDL';
+        }
+
+        if ($isOutgoing) {
+            $counterpartyName = $this->cleanupCounterpartyName($this->getVictoriaValue($doc, 'ClientCreditName'));
+            $counterpartyFiscalCode = trim($this->getVictoriaValue($doc, 'ClientCreditFiscalCode'));
+            $counterpartyAccount = $accountCredit;
+            $counterpartyBic = trim($this->getVictoriaValue($doc, 'CreditBankBIC'));
+            $amount = -1 * abs((float) $this->getVictoriaValue($doc, 'AmountDebit'));
+        } else {
+            $counterpartyName = $this->cleanupCounterpartyName($this->getVictoriaValue($doc, 'ClientDebitName'));
+            $counterpartyFiscalCode = trim($this->getVictoriaValue($doc, 'ClientDebitFiscalCode'));
+            $counterpartyAccount = $accountDebit;
+            $counterpartyBic = trim($this->getVictoriaValue($doc, 'DebitBankBIC'));
+            $amount = abs((float) $this->getVictoriaValue($doc, 'AmountCredit'));
+        }
+
+        if ($amount == 0.0) {
+            $amount = (float) $this->getVictoriaValue($doc, 'Amount');
+            if ($isOutgoing) {
+                $amount = -1 * abs($amount);
+            } else {
+                $amount = abs($amount);
+            }
+        }
+
+        $bookingDate = $this->formatDateForCsv($this->getVictoriaValue($doc, 'OrderDate'));
+        $valueDate = $this->formatDateForCsv($this->getVictoriaValue($doc, 'ExecuteDate'));
+        $bookingText = trim($this->getVictoriaValue($doc, 'DocumentTypeID'));
+        if ($bookingText === '') {
+            $bookingText = trim($this->getVictoriaValue($doc, 'MovementTypeID'));
+        }
+
+        $infoParts = array();
+        if (trim($this->getVictoriaValue($doc, 'MovementTypeID')) !== '') {
+            $infoParts[] = 'MovementTypeID='.trim($this->getVictoriaValue($doc, 'MovementTypeID'));
+        }
+        if (trim($this->getVictoriaValue($doc, 'DocumentTypeID')) !== '') {
+            $infoParts[] = 'DocumentTypeID='.trim($this->getVictoriaValue($doc, 'DocumentTypeID'));
+        }
+        if (trim($this->getVictoriaValue($doc, 'Nr')) !== '') {
+            $infoParts[] = 'Nr='.trim($this->getVictoriaValue($doc, 'Nr'));
+        }
+
+        return array(
+            $myAccount,
+            $bookingDate,
+            $valueDate,
+            $bookingText,
+            trim($this->getVictoriaValue($doc, 'Destination')),
+            $counterpartyFiscalCode,
+            trim($this->getVictoriaValue($doc, 'DocumentID')),
+            trim($this->getVictoriaValue($doc, 'MovementID')),
+            trim($this->getVictoriaValue($doc, 'Nr')),
+            '',
+            '',
+            $counterpartyName,
+            $counterpartyAccount,
+            $counterpartyBic,
+            number_format($amount, 2, '.', ''),
+            $currency,
+            implode(' ', $infoParts)
+        );
+    }
+
+
+    /**
+     * Parse Victoriabank XML documents without requiring XML extensions.
+     *
+     * @param string $xmlData Raw XML data
+     * @return array<int,array<string,string>>
+     */
+    private function parseVictoriaXmlDocuments($xmlData)
+    {
+        $documents = array();
+        if (!preg_match_all('/<Document>(.*?)<\/Document>/si', $xmlData, $matches)) {
+            return $documents;
+        }
+
+        foreach ($matches[1] as $block) {
+            $documents[] = array(
+                'Nr' => $this->extractXmlTagValue($block, 'Nr'),
+                'OrderDate' => $this->extractXmlTagValue($block, 'OrderDate'),
+                'DocumentID' => $this->extractXmlTagValue($block, 'DocumentID'),
+                'DocumentTypeID' => $this->extractXmlTagValue($block, 'DocumentTypeID'),
+                'ExecuteDate' => $this->extractXmlTagValue($block, 'ExecuteDate'),
+                'ClientDebitName' => $this->extractXmlTagValue($block, 'ClientDebitName'),
+                'ClientDebitFiscalCode' => $this->extractXmlTagValue($block, 'ClientDebitFiscalCode'),
+                'AccountDebit' => $this->extractXmlTagValue($block, 'AccountDebit'),
+                'DebitBankBIC' => $this->extractXmlTagValue($block, 'DebitBankBIC'),
+                'ClientCreditName' => $this->extractXmlTagValue($block, 'ClientCreditName'),
+                'ClientCreditFiscalCode' => $this->extractXmlTagValue($block, 'ClientCreditFiscalCode'),
+                'AccountCredit' => $this->extractXmlTagValue($block, 'AccountCredit'),
+                'CreditBankBIC' => $this->extractXmlTagValue($block, 'CreditBankBIC'),
+                'Amount' => $this->extractXmlTagValue($block, 'Amount'),
+                'AmountCredit' => $this->extractXmlTagValue($block, 'AmountCredit'),
+                'AmountDebit' => $this->extractXmlTagValue($block, 'AmountDebit'),
+                'Destination' => $this->extractXmlTagValue($block, 'Destination'),
+                'MovementID' => $this->extractXmlTagValue($block, 'MovementID'),
+                'MovementTypeID' => $this->extractXmlTagValue($block, 'MovementTypeID')
+            );
+        }
+
+        return $documents;
+    }
+
+    /**
+     * Extract a tag value from XML text.
+     *
+     * @param string $xmlData XML text
+     * @param string $tag Tag name
+     * @return string
+     */
+    private function extractXmlTagValue($xmlData, $tag)
+    {
+        if (preg_match('/<'.preg_quote($tag, '/').'>\s*(.*?)\s*<\/'.preg_quote($tag, '/').'>/si', $xmlData, $m)) {
+            return html_entity_decode(trim(strip_tags($m[1])), ENT_QUOTES | ENT_XML1, 'UTF-8');
+        }
+        return '';
+    }
+
+
+    /**
+     * Read XML value from array or SimpleXMLElement.
+     *
+     * @param mixed $doc Document source
+     * @param string $field Field name
+     * @return string
+     */
+    private function getVictoriaValue($doc, $field)
+    {
+        if (is_array($doc)) {
+            return isset($doc[$field]) ? (string) $doc[$field] : '';
+        }
+
+        if (is_object($doc) && isset($doc->{$field})) {
+            return (string) $doc->{$field};
+        }
+
+        return '';
+    }
+
+    /**
+     * Parse supported date formats.
      *
      * @param string $dateString Date string
      * @return int Timestamp
      */
     private function parseDate($dateString)
     {
-        $dd = substr($dateString, 0, 2);
-        $mm = substr($dateString, 3, 2);
-        $yyyy = substr($dateString, 6, 2);
-        if (!empty($yyyy)) {
-            $yyyy = '20' . $yyyy;
+        $dateString = trim((string) $dateString);
+        if ($dateString === '') {
+            return 0;
         }
-        return dol_mktime(0, 0, 0, $mm, $dd, $yyyy);
+
+        if (preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $dateString, $m)) {
+            return dol_mktime(0, 0, 0, (int) $m[2], (int) $m[3], (int) $m[1]);
+        }
+
+        if (preg_match('/^(\d{2})\.(\d{2})\.(\d{4})$/', $dateString, $m)) {
+            return dol_mktime(0, 0, 0, (int) $m[2], (int) $m[1], (int) $m[3]);
+        }
+
+        if (preg_match('/^(\d{2})\.(\d{2})\.(\d{2})$/', $dateString, $m)) {
+            return dol_mktime(0, 0, 0, (int) $m[2], (int) $m[1], (int) ('20'.$m[3]));
+        }
+
+        $timestamp = strtotime($dateString);
+        return ($timestamp !== false) ? $timestamp : 0;
     }
 
     /**
@@ -354,7 +640,7 @@ class BankImport extends CommonObject
     private function generateImportKey($transaction_id, $iban_other, $owner_other, $amount, $label, $ref)
     {
         if (!empty($transaction_id)) {
-            return trim($transaction_id);
+            return substr(trim($transaction_id), 0, 14);
         }
 
         $key = implode('|', array(
@@ -375,7 +661,7 @@ class BankImport extends CommonObject
      */
     private function isAlreadyImported($import_key)
     {
-        $sql = "SELECT rowid FROM " . MAIN_DB_PREFIX . "bank WHERE import_key = '" . $this->db->escape($import_key) . "'";
+        $sql = 'SELECT rowid FROM '.MAIN_DB_PREFIX."bank WHERE import_key = '".$this->db->escape($import_key)."'";
         $resql = $this->db->query($sql);
         if ($resql) {
             return $this->db->num_rows($resql) > 0;
@@ -392,7 +678,7 @@ class BankImport extends CommonObject
      */
     private function updateImportKey($bankline_id, $import_key)
     {
-        $sql = "UPDATE " . MAIN_DB_PREFIX . "bank SET import_key = '" . $this->db->escape($import_key) . "' WHERE rowid = " . ((int) $bankline_id);
+        $sql = 'UPDATE '.MAIN_DB_PREFIX."bank SET import_key = '".$this->db->escape($import_key)."' WHERE rowid = ".((int) $bankline_id);
         return $this->db->query($sql);
     }
 
@@ -404,19 +690,89 @@ class BankImport extends CommonObject
      */
     private function buildNote($data)
     {
-        $note = '';
-        $sep = '';
+        $noteParts = array();
 
         if (!empty($data[$this->fieldMapping['collector_reference']])) {
-            $note .= $sep . 'Sammlerreferenz=' . $data[$this->fieldMapping['collector_reference']];
-            $sep = ' ';
+            $noteParts[] = 'Sammlerreferenz='.$data[$this->fieldMapping['collector_reference']];
         }
 
         if (!empty($data[$this->fieldMapping['creditor_id']])) {
-            $note .= $sep . 'GlaeubigerId=' . $data[$this->fieldMapping['creditor_id']];
-            $sep = ' ';
+            $noteParts[] = 'GlaeubigerId='.$data[$this->fieldMapping['creditor_id']];
         }
 
-        return $note;
+        if (!empty($data[$this->fieldMapping['info']])) {
+            $noteParts[] = trim($data[$this->fieldMapping['info']]);
+        }
+
+        return implode(' ', $noteParts);
     }
-} 
+
+    /**
+     * Normalize account value.
+     *
+     * @param string $account Account value
+     * @return string
+     */
+    private function normalizeAccount($account)
+    {
+        $account = trim((string) $account);
+        if ($account === '') {
+            return '';
+        }
+        if (strpos($account, '/') !== false) {
+            $parts = explode('/', $account);
+            $account = trim($parts[0]);
+        }
+        return $account;
+    }
+
+    /**
+     * Extract currency from account values.
+     *
+     * @param string $accountDebit Debit account string
+     * @param string $accountCredit Credit account string
+     * @param string $myAccount Own normalized account
+     * @return string
+     */
+    private function extractCurrency($accountDebit, $accountCredit, $myAccount)
+    {
+        $candidates = array($accountDebit, $accountCredit, $myAccount);
+        foreach ($candidates as $candidate) {
+            if (preg_match('/\/([A-Z]{3})$/', trim((string) $candidate), $m)) {
+                return $m[1];
+            }
+            if (preg_match('/([A-Z]{3})$/', trim((string) $candidate), $m)) {
+                return $m[1];
+            }
+        }
+        return '';
+    }
+
+    /**
+     * Cleanup counterparty names.
+     *
+     * @param string $name Counterparty name
+     * @return string
+     */
+    private function cleanupCounterpartyName($name)
+    {
+        $name = trim((string) $name);
+        $name = preg_replace('/^\(R\)\s*/', '', $name);
+        return $name;
+    }
+
+    /**
+     * Format XML date to CSV date format.
+     *
+     * @param string $date Date in YYYY-MM-DD
+     * @return string
+     */
+    private function formatDateForCsv($date)
+    {
+        $date = trim((string) $date);
+        if (preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $date, $m)) {
+            return $m[3].'.'.$m[2].'.'.substr($m[1], 2, 2);
+        }
+        return $date;
+    }
+}
